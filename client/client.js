@@ -11,11 +11,17 @@
 //     above the settings gear) — click to enter/exit "clean mode";
 //   · in clean mode a highlight box follows the hovered element, right-click
 //     removes it (left-click untouched), Esc exits;
-//   · every removal is recorded (XPath + outerHTML + parent/index) into
-//     localStorage and re-applied continuously (MutationObserver sweep), so
-//     removals survive re-renders and page reloads;
+//   · every removal moves the element into a hidden "limbo" container (kept as
+//     the live node, id stripped) and records XPath + outerHTML + parent/index
+//     into localStorage; a MutationObserver sweep keeps removals alive across
+//     re-renders and reloads by re-removing only elements whose outerHTML
+//     exactly matches the recorded snapshot — position-drifted neighbours are
+//     never touched (no cascade deletes);
 //   · registers a `settings.section` entry (id `simplify`) rendering the list
-//     of removed elements with per-item 恢复, per-item checkbox and 批量恢复.
+//     of removed elements with per-item 恢复, per-item checkbox and 批量恢复 —
+//     each row also draws the element again at its original style: the live
+//     node is parked into the row's preview area, so clicking it performs the
+//     element's original action without restoring it to its old position.
 
 window.__ModuleLoader__.load({
 	id: 'dsh-simplify',
@@ -51,6 +57,7 @@ window.__ModuleLoader__.load({
 		let hintEl = null
 		let hintMsgEl = null
 		let highlightEl = null
+		let limboEl = null
 		let movePending = 0
 		let lastX = 0
 		let lastY = 0
@@ -73,7 +80,12 @@ window.__ModuleLoader__.load({
 			persistTimer = setTimeout(() => {
 				persistTimer = 0
 				try {
-					localStorage.setItem(STORE_KEY, JSON.stringify(state.records))
+					// `_live` is a runtime node reference — never persist it.
+					localStorage.setItem(STORE_KEY, JSON.stringify(state.records.map((r) => {
+						const copy = Object.assign({}, r)
+						delete copy._live
+						return copy
+					})))
 				} catch (_) { /* quota / privacy mode — keep in-memory only */ }
 			}, 120)
 		}
@@ -149,6 +161,28 @@ window.__ModuleLoader__.load({
 				idx += 1
 			}
 			return Math.max(0, idx - 1)
+		}
+		// Hidden "limbo" container: removed elements live here (kept alive as the
+		// same node, id stripped so document.getElementById never collides) and
+		// are parked into the settings preview rows while that page is open.
+		function ensureLimbo() {
+			if (limboEl && limboEl.isConnected) return limboEl
+			limboEl = document.createElement('div')
+			limboEl.setAttribute(OWN_ATTR, 'true')
+			limboEl.dataset.dshLimbo = 'true'
+			limboEl.style.display = 'none'
+			document.body.appendChild(limboEl)
+			return limboEl
+		}
+		function moveToLimbo(el) {
+			if (!el) return
+			if (el.id) el.removeAttribute('id')
+			ensureLimbo().appendChild(el)
+		}
+		function moveAllLiveToLimbo() {
+			for (const rec of state.records) {
+				if (rec._live && rec._live.isConnected) moveToLimbo(rec._live)
+			}
 		}
 		function trimText(s, max) {
 			const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
@@ -288,8 +322,10 @@ window.__ModuleLoader__.load({
 				parentXpath: xpathOf(parent),
 				index: indexAmongChildren(el),
 				label: labelOf(el),
+				idAttr: el.id || '',
+				_live: el,
 			}
-			el.remove()
+			moveToLimbo(el)
 			state.records.unshift(record)
 			if (state.records.length > MAX_RECORDS) state.records.length = MAX_RECORDS
 			pruneChecked()
@@ -312,9 +348,19 @@ window.__ModuleLoader__.load({
 			if (!document.body || destroyed) return
 			for (const rec of state.records) {
 				const el = findEl(rec.xpath)
-				if (el && el.isConnected && !isOwnUi(el) && !isProtectedRoot(el) && !inShadowDom(el)) {
-					el.remove()
-				}
+				if (!el || !el.isConnected) continue
+				// Our own live node (parked in limbo/preview) is never at the
+				// recorded spot — but never touch it even if it somehow matches.
+				if (rec._live && el.isSameNode(rec._live)) continue
+				// Identity fingerprint: only re-remove an element whose markup is
+				// byte-identical to the one the user originally removed. After a
+				// re-render/list shift, the recorded position may now hold a
+				// DIFFERENT element (e.g. the next nav row) — removing it would
+				// cascade deletes down the column, so drifted neighbours are left
+				// alone. React-recreated identical copies still match and die.
+				if (el.outerHTML !== rec.html) continue
+				if (isOwnUi(el) || isProtectedRoot(el) || inShadowDom(el)) continue
+				el.remove()
 			}
 		}
 		function ensureObserver() {
@@ -331,9 +377,26 @@ window.__ModuleLoader__.load({
 			const rec = state.records[ix]
 			const parent = findEl(rec.parentXpath)
 			if (!parent || !parent.isConnected) return 'noparent'
-			// Already back in the DOM (e.g. the app re-created it): just retire the rule.
+			// Live node (still parked in limbo or a settings-preview row): move
+			// the very same node back to its original position — id restored, so
+			// the element is exactly as it was before removal.
+			if (rec._live && rec._live.isConnected) {
+				const twin = findEl(rec.xpath)
+				if (twin && twin !== rec._live && twin.outerHTML === rec.html) twin.remove()
+				if (rec.idAttr) rec._live.id = rec.idAttr
+				const targetIndex = Math.min(rec.index, parent.children.length)
+				parent.insertBefore(rec._live, parent.children[targetIndex] || null)
+				rec._live = null
+				state.records.splice(ix, 1)
+				pruneChecked()
+				schedulePersist()
+				notify()
+				return 'ok'
+			}
+			// Reload path: a re-created element must be byte-identical before we
+			// treat it as "already back" — a drifted different element is not it.
 			const existing = findEl(rec.xpath)
-			if (existing && existing.isConnected) {
+			if (existing && existing.isConnected && existing.outerHTML === rec.html) {
 				state.records.splice(ix, 1)
 				pruneChecked()
 				schedulePersist()
@@ -389,7 +452,7 @@ window.__ModuleLoader__.load({
 			sub.className = 'ds-s-sec-sub'
 			sub.textContent = records.length === 0
 				? '这里管理被移除的页面元素。'
-				: '已移除 ' + records.length + ' 个元素。恢复后该元素会以原样回到原位置。'
+				: '已移除 ' + records.length + ' 个元素。预览区可点击体验原操作，恢复后原样回到原位置。'
 
 			const tools = document.createElement('div')
 			tools.className = 'ds-s-sec-tools'
@@ -463,10 +526,33 @@ window.__ModuleLoader__.load({
 				restoreBtn.textContent = '恢复'
 				restoreBtn.dataset.dsAct = 'restore'
 
+				const preview = document.createElement('div')
+				preview.className = 'ds-s-preview'
+				preview.dataset.role = 'preview'
+				preview.setAttribute(OWN_ATTR, 'true')
+				const live = rec._live && rec._live.isConnected ? rec._live : null
+				if (live) {
+					// Park the very same node here: original style and events intact,
+					// so clicking the preview performs the element's original action
+					// without restoring it to its old position.
+					preview.appendChild(live)
+				} else {
+					// Reloaded record: the recorded markup is the only thing left —
+					// render it as a static, non-interactive style preview.
+					const tpl = document.createElement('template')
+					tpl.innerHTML = rec.html
+					if (tpl.content.firstElementChild) preview.appendChild(tpl.content)
+					const cap = document.createElement('div')
+					cap.className = 'ds-s-preview-cap'
+					cap.textContent = '刷新后快照 · 仅样式预览（无交互）'
+					preview.appendChild(cap)
+				}
+
 				li.appendChild(box)
 				li.appendChild(info)
 				li.appendChild(restoreBtn)
 				li.appendChild(err)
+				li.appendChild(preview)
 				list.appendChild(li)
 			}
 
@@ -476,7 +562,7 @@ window.__ModuleLoader__.load({
 			empty.textContent = '还没有移除任何元素。点击左侧底部的「简化」按钮进入清理模式，鼠标悬浮到元素上按右键即可移除。'
 			const hintLine = document.createElement('div')
 			hintLine.className = 'ds-s-hintline'
-			hintLine.textContent = '被移除的元素会在页面中持续隐藏（包括刷新之后），直到在这里恢复。'
+			hintLine.textContent = '被移除的元素会持续隐藏（包括刷新之后）。行内预览区可点击执行该元素原本的操作，且不会还原位置；点击「恢复」才会把它原样放回原处。'
 
 			root.appendChild(head)
 			root.appendChild(list)
@@ -542,7 +628,7 @@ window.__ModuleLoader__.load({
 				const render = () => renderSection(root)
 				render()
 				const off = subscribe(render)
-				return () => { off() }
+				return () => { off(); moveAllLiveToLimbo() }
 			}, [])
 			return h('div', { ref: rootRef, className: 'ds-s-sec', [OWN_ATTR]: 'true' })
 		}
@@ -608,6 +694,8 @@ window.__ModuleLoader__.load({
 .ds-s-row-name{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ds-s-row-meta{font-size:12px;color:var(--dsw-alias-label-secondary,rgba(38,42,51,.66));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
 .ds-s-row-err{color:#cf353b;font-size:12px;margin-top:4px;display:none}
+.ds-s-preview{flex:1 0 100%;order:9;box-sizing:border-box;margin-top:8px;max-height:140px;overflow:auto;padding:10px;border:1px dashed rgba(127,127,127,.45);border-radius:10px;background:var(--dsw-alias-bg-layer-0,rgba(127,127,127,.05))}
+.ds-s-preview-cap{margin-top:8px;font-size:12px;color:var(--dsw-alias-label-secondary,rgba(38,42,51,.55))}
 .ds-s-empty{background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.07));border-radius:12px;padding:18px 16px;color:var(--dsw-alias-label-secondary,rgba(38,42,51,.66));font-size:13px}
 .ds-s-hintline{color:var(--dsw-alias-label-secondary,rgba(38,42,51,.55));font-size:12px}`
 
