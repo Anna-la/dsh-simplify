@@ -1,0 +1,28 @@
+{
+  "name": "dsh-simplify",
+  "version": "0.1.0",
+  "description": "界面简化插件：清理模式下右键移除页面元素，自动记住移除记录，并可在 设置 → 简化 中逐个或批量恢复。",
+  "type": "module",
+  "main": "lib/index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Anna-la/dsh-simplify.git"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "license": "MIT"
+}
