@@ -352,15 +352,27 @@ window.__ModuleLoader__.load({
 				// Our own live node (parked in limbo/preview) is never at the
 				// recorded spot — but never touch it even if it somehow matches.
 				if (rec._live && el.isSameNode(rec._live)) continue
-				// Identity fingerprint: only re-remove an element whose markup is
+				// Identity fingerprint: only ever act on an element whose markup is
 				// byte-identical to the one the user originally removed. After a
 				// re-render/list shift, the recorded position may now hold a
 				// DIFFERENT element (e.g. the next nav row) — removing it would
 				// cascade deletes down the column, so drifted neighbours are left
-				// alone. React-recreated identical copies still match and die.
+				// alone.
 				if (el.outerHTML !== rec.html) continue
 				if (isOwnUi(el) || isProtectedRoot(el) || inShadowDom(el)) continue
-				el.remove()
+				if (rec._live) {
+					// A newer twin replaced the live node (React remounted it) — drop
+					// the twin so the removal stays applied.
+					el.remove()
+					continue
+				}
+				// After a page reload the live node is gone; the app re-created an
+				// identical element. ADOPT it instead of deleting: the page stays
+				// clean (element leaves its position) while the preview gains a
+				// live, fully interactive handle on the re-created node — clicking
+				// it performs the element's original action even after reloads.
+				rec._live = el
+				moveToLimbo(rec._live)
 			}
 		}
 		function ensureObserver() {
@@ -760,6 +772,7 @@ window.__ModuleLoader__.load({
 				restoreChecked,
 				sweep,
 				renderSection,
+				simulateReload: () => { for (const r of state.records) r._live = null },
 				records: () => state.records.map((r) => ({ ...r })),
 				active: () => state.active,
 				clear: () => { state.records = []; state.checked.clear(); schedulePersist(); notify() },
