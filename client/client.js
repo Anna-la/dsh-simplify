@@ -75,19 +75,76 @@ window.__ModuleLoader__.load({
 
 		/* ── storage ───────────────────────────────────────────────────────── */
 
+		// Durable bridge: localStorage alone is origin-scoped and dies when DSH
+		// relaunches the web server on a new port; the server half (lib/index.js)
+		// mirrors the records into ~/.dsh-simplify/records.json so removals
+		// survive restarts. Server is authoritative; localStorage is a fast
+		// mirror / offline fallback.
+		const SERVER_RECORDS_URL = '/api/dsh-simplify/records'
+		let serverReachable = false
+
+		function serializeRecords() {
+			// `_live` is a runtime node reference — never persist it.
+			return state.records.map((r) => {
+				const copy = Object.assign({}, r)
+				delete copy._live
+				return copy
+			})
+		}
+		function persistLocal() {
+			try {
+				localStorage.setItem(STORE_KEY, JSON.stringify(serializeRecords()))
+			} catch (_) { /* quota / privacy mode — keep in-memory only */ }
+		}
+		function pushToServer() {
+			if (!serverReachable) return
+			try {
+				fetch(SERVER_RECORDS_URL, {
+					method: 'PUT',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ records: serializeRecords() }),
+				}).catch(() => { /* bridge down mid-session — local mirror still holds */ })
+			} catch (_) { /* fetch unavailable — local-only */ }
+		}
 		function schedulePersist() {
 			if (persistTimer) clearTimeout(persistTimer)
 			persistTimer = setTimeout(() => {
 				persistTimer = 0
-				try {
-					// `_live` is a runtime node reference — never persist it.
-					localStorage.setItem(STORE_KEY, JSON.stringify(state.records.map((r) => {
-						const copy = Object.assign({}, r)
-						delete copy._live
-						return copy
-					})))
-				} catch (_) { /* quota / privacy mode — keep in-memory only */ }
+				persistLocal()
+				pushToServer()
 			}, 120)
+		}
+		async function syncFromServer() {
+			try {
+				const res = await fetch(SERVER_RECORDS_URL, { method: 'GET', cache: 'no-store' })
+				if (!res.ok) return
+				const data = await res.json()
+				if (!data || data.ok !== true || !Array.isArray(data.records)) return
+				const fresh = data.records
+					.filter((r) => r && typeof r === 'object'
+						&& typeof r.id === 'string'
+						&& typeof r.xpath === 'string'
+						&& typeof r.html === 'string'
+						&& typeof r.parentXpath === 'string'
+						&& typeof r.index === 'number'
+						&& typeof r.label === 'string')
+					.slice(0, MAX_RECORDS)
+				if (fresh.length > 0) {
+					// Server is authoritative across restarts; local is the mirror.
+					state.records = fresh
+					persistLocal()
+					notify()
+					// Re-apply removals right away: on a real restart the page
+					// elements already exist — don't wait for the next mutation.
+					scheduleSweep()
+				} else if (state.records.length > 0) {
+					// First run with the bridge present: migrate existing
+					// localStorage-only records up so they survive too.
+					serverReachable = true
+					pushToServer()
+				}
+				serverReachable = true
+			} catch (_) { /* no bridge / offline — localStorage fallback keeps working */ }
 		}
 		function loadRecords() {
 			try {
@@ -726,6 +783,9 @@ window.__ModuleLoader__.load({
 
 		function engineStart() {
 			loadRecords()
+			// Pull durable records from the server bridge (survives restarts /
+			// port changes); falls back to the localStorage mirror when absent.
+			void syncFromServer()
 			document.addEventListener('contextmenu', onContextMenu, true)
 			document.addEventListener('pointermove', onPointerMove, true)
 			document.addEventListener('keydown', onKeyDown, true)
@@ -773,6 +833,8 @@ window.__ModuleLoader__.load({
 				sweep,
 				renderSection,
 				simulateReload: () => { for (const r of state.records) r._live = null },
+				syncNow: () => syncFromServer(),
+				replaceRecords: (arr) => { state.records = Array.isArray(arr) ? arr : [] },
 				records: () => state.records.map((r) => ({ ...r })),
 				active: () => state.active,
 				clear: () => { state.records = []; state.checked.clear(); schedulePersist(); notify() },
