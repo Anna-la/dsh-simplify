@@ -1,0 +1,6 @@
+# dsh-simplify bundle patch: mounts this plugin into a profile's layer stack.
+# The active row lives in the web profile's cordis.patch.yml; this file is the
+# package-declared copy used by install tooling.
+- insert:
+    - id: dsh-simplify
+      name: dsh-simplify
